@@ -1,2 +1,2 @@
 # McQmcOptions
-MonteCarlo and Quasi-MonteCarlo methods for the valuations of spread and lookback finantial options.
+MonteCarlo and Quasi-MonteCarlo methods for assessment of spread and lookback style finantial markerts stock options.
