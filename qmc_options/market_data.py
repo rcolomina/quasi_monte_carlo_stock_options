@@ -2,15 +2,26 @@
 Market data integration for model calibration and real-time pricing.
 
 Supports:
+- Traditional markets: yfinance (stocks, ETFs, indices)
+- Crypto (historical): CoinGecko, Binance
+- Crypto (live): Pyth Network (for Solana)
 - Options chain data
 - Historical prices
 - Implied volatility surfaces
-- Real-time feeds
 """
 
 import numpy as np
 import pandas as pd
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
+import warnings
+
+try:
+    import requests
+    HAVE_REQUESTS = True
+except ImportError:
+    HAVE_REQUESTS = False
+    warnings.warn("requests not installed. Run: pip install requests")
 
 
 class MarketDataFeed:
@@ -113,29 +124,129 @@ class MarketDataFeed:
         # https://fred.stlouisfed.org/series/DGS10
         return 0.04  # 4% default
 
+    @staticmethod
+    def fetch_crypto_coingecko(coin_id: str, days: int = 365) -> pd.DataFrame:
+        """
+        Fetch crypto data from CoinGecko API (free).
 
-def calculate_historical_volatility(prices: pd.Series, window: int = 30) -> float:
+        Parameters
+        ----------
+        coin_id : str
+            CoinGecko ID: "bitcoin", "ethereum", "solana", etc.
+        days : int
+            Number of days of history
+
+        Returns
+        -------
+        DataFrame
+            Columns: ['timestamp', 'price']
+        """
+        if not HAVE_REQUESTS:
+            raise ImportError("Install requests: pip install requests")
+
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        params = {
+            'vs_currency': 'usd',
+            'days': days,
+            'interval': 'daily'
+        }
+
+        response = requests.get(url, params=params)
+        data = response.json()
+
+        if 'prices' not in data:
+            raise ValueError(f"Failed to fetch {coin_id}: {data}")
+
+        prices = data['prices']
+        df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        return df
+
+    @staticmethod
+    def fetch_crypto_binance(symbol: str, interval: str = "1d",
+                            start_date: str = None, limit: int = 1000) -> pd.DataFrame:
+        """
+        Fetch crypto data from Binance API (free, high quality).
+
+        Parameters
+        ----------
+        symbol : str
+            Trading pair (e.g., "BTCUSDT", "SOLUSDT", "ETHUSDT")
+        interval : str
+            Candlestick interval: "1m", "5m", "1h", "1d", etc.
+        start_date : str
+            Start date "YYYY-MM-DD" (optional)
+        limit : int
+            Max number of candles (default 1000)
+
+        Returns
+        -------
+        DataFrame
+            OHLCV data
+        """
+        if not HAVE_REQUESTS:
+            raise ImportError("Install requests: pip install requests")
+
+        url = "https://api.binance.com/api/v3/klines"
+
+        params = {
+            'symbol': symbol,
+            'interval': interval,
+            'limit': limit
+        }
+
+        if start_date:
+            start_ts = int(pd.Timestamp(start_date).timestamp() * 1000)
+            params['startTime'] = start_ts
+
+        response = requests.get(url, params=params)
+        data = response.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"Binance API error: {data}")
+
+        df = pd.DataFrame(data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df[['open', 'high', 'low', 'close', 'volume']] = \
+            df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+
+        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+
+
+def calculate_historical_volatility(prices, window: int = 30, trading_days: int = 252) -> float:
     """
     Calculate historical volatility (annualized).
 
     Parameters
     ----------
-    prices : pd.Series
+    prices : pd.Series or np.ndarray
         Daily closing prices
     window : int
         Rolling window in days
+    trading_days : int
+        Trading days per year (252 for stocks, 365 for crypto)
 
     Returns
     -------
     float
         Annualized historical volatility
     """
-    returns = np.log(prices / prices.shift(1)).dropna()
+    if isinstance(prices, pd.Series):
+        returns = np.log(prices / prices.shift(1)).dropna().values
+    else:
+        returns = np.diff(np.log(prices))
 
     if len(returns) < window:
         window = len(returns)
 
-    volatility = returns.tail(window).std() * np.sqrt(252)
+    recent_returns = returns[-window:]
+    volatility = np.std(recent_returns) * np.sqrt(trading_days)
 
     return volatility
 
@@ -281,3 +392,106 @@ def calibrate_model_from_market(ticker: str, expiration_date: str,
     params['calibration_date'] = datetime.now().isoformat()
 
     return params
+
+
+def calibrate_asset_from_ticker(ticker: str,
+                               lookback_days: int = 365,
+                               asset_type: str = "auto") -> Dict:
+    """
+    Complete calibration pipeline from ticker to model parameters.
+
+    Parameters
+    ----------
+    ticker : str
+        "AAPL" for stocks, "solana" for crypto (CoinGecko), "BTCUSDT" for Binance
+    lookback_days : int
+        Historical data window
+    asset_type : str
+        "stock", "crypto_coingecko", "crypto_binance", or "auto" (detect)
+
+    Returns
+    -------
+    dict
+        Complete calibration results with characteristics and parameters
+
+    Examples
+    --------
+    >>> # Calibrate Apple stock
+    >>> result = calibrate_asset_from_ticker("AAPL", lookback_days=365)
+    >>> print(f"Model: {result['model']}, Vol: {result['characteristics'].volatility:.2%}")
+
+    >>> # Calibrate Solana
+    >>> result = calibrate_asset_from_ticker("solana", asset_type="crypto_coingecko")
+    >>> print(f"Recommended: {result['model']}")
+
+    >>> # Calibrate Bitcoin from Binance
+    >>> result = calibrate_asset_from_ticker("BTCUSDT", asset_type="crypto_binance")
+    """
+    from qmc_options.calibration import AssetAnalyzer, ModelCalibrator
+
+    # Auto-detect asset type
+    if asset_type == "auto":
+        if ticker.endswith("USDT"):
+            asset_type = "crypto_binance"
+        elif len(ticker) <= 5 and ticker.isupper():
+            asset_type = "stock"
+        else:
+            asset_type = "crypto_coingecko"
+
+    # Fetch data
+    print(f"📊 Fetching {lookback_days} days of data for {ticker}...")
+
+    if asset_type == "stock":
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        data = MarketDataFeed.get_historical_prices(ticker, start_date, end_date)
+        prices = data['Close'].values
+        trading_days = 252
+
+    elif asset_type == "crypto_coingecko":
+        data = MarketDataFeed.fetch_crypto_coingecko(ticker, days=lookback_days)
+        prices = data['price'].values
+        trading_days = 365
+
+    elif asset_type == "crypto_binance":
+        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        data = MarketDataFeed.fetch_crypto_binance(ticker, interval="1d",
+                                                   start_date=start_date)
+        prices = data['close'].values
+        trading_days = 365
+
+    else:
+        raise ValueError(f"Unknown asset_type: {asset_type}")
+
+    print(f"✅ Fetched {len(prices)} days")
+
+    # Analyze characteristics
+    print(f"🔍 Analyzing characteristics...")
+    analyzer = AssetAnalyzer(ticker)
+    characteristics = analyzer.analyze(prices, trading_days_per_year=trading_days)
+    print(characteristics)
+
+    # Calibrate model
+    print(f"\n⚙️  Calibrating {characteristics.recommended_model.upper()}...")
+    calibrator = ModelCalibrator(characteristics)
+
+    if characteristics.recommended_model == "heston":
+        params = calibrator.calibrate_heston(prices)
+    elif characteristics.recommended_model == "merton":
+        params = calibrator.calibrate_merton(prices)
+    elif characteristics.recommended_model == "bates":
+        params = calibrator.calibrate_bates(prices)
+    else:  # black_scholes
+        params = {'sigma': characteristics.volatility}
+
+    print(f"✅ Calibration complete!")
+
+    return {
+        'ticker': ticker,
+        'characteristics': characteristics,
+        'model': characteristics.recommended_model,
+        'parameters': params,
+        'current_price': float(prices[-1]),
+        'trading_days': trading_days,
+        'data': data
+    }
