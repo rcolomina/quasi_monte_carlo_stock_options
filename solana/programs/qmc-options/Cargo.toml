@@ -1,0 +1,21 @@
+[package]
+name = "qmc-options"
+version = "0.1.0"
+description = "QMC-based options pricing protocol on Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "qmc_options"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"
+anchor-spl = "0.29.0"
+pyth-sdk-solana = "0.8.0"
