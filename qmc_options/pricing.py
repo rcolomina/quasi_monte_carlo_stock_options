@@ -54,7 +54,8 @@ def european_call_mc(S0: float, K: float, r: float, delta: float,
 
 def spread_option(points: np.ndarray, w1: float, w2: float, r: float, K: float,
                   S10: float, S20: float, delta1: float, delta2: float,
-                  sigma1: float, sigma2: float, rho12: float, T: float) -> float:
+                  sigma1: float, sigma2: float, rho12: float, T: float,
+                  periodization: int = 8) -> float:
     """
     Price spread option using QMC: max(w1*S1 - w2*S2 - K, 0).
 
@@ -88,12 +89,16 @@ def spread_option(points: np.ndarray, w1: float, w2: float, r: float, K: float,
         Correlation between underlyings
     T : float
         Time to maturity
+    periodization : int, default=8
+        Periodization transformation (1-8). Default 8 = identity (no transform).
 
     Returns
     -------
     float
         Spread option price
     """
+    from .periodization import PeriodicTransform
+
     N = len(points)
     value = 0.0
 
@@ -107,7 +112,15 @@ def spread_option(points: np.ndarray, w1: float, w2: float, r: float, K: float,
     c22 = np.sqrt(1 - rho12 ** 2) * sigma2 * np.sqrt(T)
 
     for i in range(N):
-        u1, u2 = points[i, 0], points[i, 1]
+        # Apply periodization transformation
+        u1_raw, u2_raw = points[i, 0], points[i, 1]
+        u1 = PeriodicTransform.transform(np.array([u1_raw]), periodization)[0]
+        u2 = PeriodicTransform.transform(np.array([u2_raw]), periodization)[0]
+
+        # Jacobian from periodization
+        du1 = PeriodicTransform.derivative(np.array([u1_raw]), periodization)[0]
+        du2 = PeriodicTransform.derivative(np.array([u2_raw]), periodization)[0]
+        jacobian = du1 * du2
 
         if u1 > 0:  # Safety criterion
             inv_u1 = stats.norm.ppf(u1)
@@ -122,7 +135,7 @@ def spread_option(points: np.ndarray, w1: float, w2: float, r: float, K: float,
                 h4 = c21 * inv_u1 + c22 * h5 + mu2T
                 h2 = w2 * np.exp(h4)
                 h = h2 - h1 - K
-                value += (1 - d2) * h
+                value += (1 - d2) * h * jacobian
 
     return np.exp(-r * T) * value / N
 
